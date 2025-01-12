@@ -232,14 +232,14 @@ def loss_backwards(fp16, loss, optimizer, loss_id, **kwargs):
     else:
         loss.backward(**kwargs)
 
-def gradient_penalty(images, output, weight = 10):
+def gradient_penalty(images, output, weight = 10, center = 0.):
     batch_size = images.shape[0]
     gradients = torch_grad(outputs=output, inputs=images,
                            grad_outputs=torch.ones(output.size(), device=images.device),
                            create_graph=True, retain_graph=True, only_inputs=True)[0]
 
     gradients = gradients.reshape(batch_size, -1)
-    return weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return weight * ((gradients.norm(2, dim=1) - center) ** 2).mean()
 
 def calc_pl_lengths(styles, images):
     device = images.device
@@ -299,15 +299,15 @@ def slerp(val, low, high):
 def gen_hinge_loss(fake, real):
     return fake.mean()
 
-def hinge_loss(real, fake):
+def hinge_loss(fake, real):
     return (F.relu(1 + real) + F.relu(1 - fake)).mean()
 
-def dual_contrastive_loss(real_logits, fake_logits):
+def dual_contrastive_loss(fake_logits, real_logits):
     device = real_logits.device
     real_logits, fake_logits = map(lambda t: rearrange(t, '... -> (...)'), (real_logits, fake_logits))
 
     def loss_half(t1, t2):
-        t1 = rearrange(t1, 'i -> i ()')
+        t1 = rearrange(t1, 'i -> i 1')
         t2 = repeat(t2, 'j -> i j', i = t1.shape[0])
         t = torch.cat((t1, t2), dim = -1)
         return F.cross_entropy(t, torch.zeros(t1.shape[0], device = device, dtype = torch.long))
@@ -396,7 +396,7 @@ class AugWrapper(nn.Module):
         super().__init__()
         self.D = D
 
-    def forward(self, images, prob = 0., types = [], detach = False):
+    def forward(self, images, prob = 0., types = [], detach = False, return_aug_images = False, input_requires_grad = False):
         if random() < prob:
             images = random_hflip(images, prob=0.5)
             images = DiffAugment(images, types=types)
@@ -404,7 +404,15 @@ class AugWrapper(nn.Module):
         if detach:
             images = images.detach()
 
-        return self.D(images)
+        if input_requires_grad:
+            images.requires_grad_()
+
+        logits = self.D(images)
+
+        if not return_aug_images:
+            return logits
+
+        return images, logits
 
 # stylegan2 classes
 
@@ -1030,10 +1038,13 @@ class Trainer():
             w_styles = styles_def_to_tensor(w_space)
 
             generated_images = G(w_styles, noise)
-            fake_output, fake_q_loss = D_aug(generated_images.clone().detach(), detach = True, **aug_kwargs)
+            generated_images, (fake_output, fake_q_loss) = D_aug(generated_images.clone().detach(), return_aug_images = True, input_requires_grad = apply_gradient_penalty, detach = True, **aug_kwargs)
 
             image_batch = next(self.loader).cuda(self.rank)
-            image_batch.requires_grad_()
+
+            if apply_gradient_penalty:
+                image_batch.requires_grad_()
+
             real_output, real_q_loss = D_aug(image_batch, **aug_kwargs)
 
             real_output_loss = real_output
@@ -1043,7 +1054,7 @@ class Trainer():
                 real_output_loss = real_output_loss - fake_output.mean()
                 fake_output_loss = fake_output_loss - real_output.mean()
 
-            divergence = D_loss_fn(real_output_loss, fake_output_loss)
+            divergence = D_loss_fn(fake_output_loss, real_output_loss)
             disc_loss = divergence
 
             if self.has_fq:
@@ -1053,7 +1064,7 @@ class Trainer():
                 disc_loss = disc_loss + quantize_loss
 
             if apply_gradient_penalty:
-                gp = gradient_penalty(image_batch, real_output)
+                gp = gradient_penalty(image_batch, real_output) + gradient_penalty(generated_images, fake_output)
                 self.last_gp_loss = gp.clone().detach().item()
                 self.track(self.last_gp_loss, 'GP')
                 disc_loss = disc_loss + gp
@@ -1251,8 +1262,8 @@ class Trainer():
         return fid_score.calculate_fid_given_paths([str(real_path), str(fake_path)], 256, noise.device, 2048)
 
     @torch.no_grad()
-    def truncate_style(self, tensor, trunc_psi = 0.75):
-        S = self.GAN.S
+    def truncate_style(self, tensor, S = None, trunc_psi = 0.75):
+        S = default(S, self.GAN.S)
         batch_size = self.batch_size
         latent_dim = self.GAN.G.latent_dim
 
@@ -1267,17 +1278,17 @@ class Trainer():
         return tensor
 
     @torch.no_grad()
-    def truncate_style_defs(self, w, trunc_psi = 0.75):
+    def truncate_style_defs(self, w, S = None, trunc_psi = 0.75):
         w_space = []
         for tensor, num_layers in w:
-            tensor = self.truncate_style(tensor, trunc_psi = trunc_psi)            
+            tensor = self.truncate_style(tensor, S = S, trunc_psi = trunc_psi)
             w_space.append((tensor, num_layers))
         return w_space
 
     @torch.no_grad()
     def generate_truncated(self, S, G, style, noi, trunc_psi = 0.75, num_image_tiles = 8):
         w = map(lambda t: (S(t[0]), t[1]), style)
-        w_truncated = self.truncate_style_defs(w, trunc_psi = trunc_psi)
+        w_truncated = self.truncate_style_defs(w, S = S, trunc_psi = trunc_psi)
         w_styles = styles_def_to_tensor(w_truncated)
         generated_images = evaluate_in_chunks(self.batch_size, G, w_styles, noi)
         return generated_images.clamp_(0., 1.)
@@ -1382,7 +1393,7 @@ class Trainer():
 
         self.steps = name * self.save_every
 
-        load_data = torch.load(self.model_name(name))
+        load_data = torch.load(self.model_name(name), weights_only = True)
 
         if 'version' in load_data:
             print(f"loading from version {load_data['version']}")
